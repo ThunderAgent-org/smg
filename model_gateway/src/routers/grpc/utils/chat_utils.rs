@@ -487,6 +487,7 @@ pub fn create_stop_decoder(
     stop_token_ids: Option<&Vec<u32>>,
     skip_special_tokens: bool,
     no_stop_trim: bool,
+    ignore_eos: bool,
 ) -> StopSequenceDecoder {
     // Extract stop sequences
     let stop_sequences: Vec<String> = match stop {
@@ -508,15 +509,24 @@ pub fn create_stop_decoder(
         };
     }
 
-    // Add stop token IDs (visible if no_stop_trim is true, hidden otherwise)
-    if let Some(token_ids) = stop_token_ids {
-        for &token_id in token_ids {
-            builder = if no_stop_trim {
-                builder.visible_stop_token(token_id)
-            } else {
-                builder.stop_token(token_id)
-            };
-        }
+    // Collect stop token IDs: EOS from tokenizer (unless ignore_eos) + user-provided.
+    // EOS tokens come from generation_config.json and are stripped at the token ID
+    // level before decoding, matching vllm/sglang behavior.
+    // When ignore_eos=true, EOS tokens are not added — the backend continues past EOS.
+    let eos_ids = if ignore_eos {
+        &[] as &[u32]
+    } else {
+        tokenizer.eos_token_ids()
+    };
+    for &token_id in eos_ids
+        .iter()
+        .chain(stop_token_ids.map(|ids| ids.as_slice()).unwrap_or_default())
+    {
+        builder = if no_stop_trim {
+            builder.visible_stop_token(token_id)
+        } else {
+            builder.stop_token(token_id)
+        };
     }
 
     builder.build()
