@@ -21,8 +21,8 @@ use openai_protocol::{
 };
 use serde_json::{json, to_value, Value};
 use smg_mcp::{
-    mcp_response_item_id, McpServerBinding, McpToolSession, ResponseFormat, ResponseTransformer,
-    ToolExecutionInput,
+    extract_embedded_openai_responses, mcp_response_item_id, McpServerBinding, McpToolSession,
+    ResponseFormat, ResponseTransformer, ToolExecutionInput,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -74,6 +74,7 @@ impl ToolLoopState {
     /// transformed output item (to avoid re-transformation later).
     pub fn record_call(
         &mut self,
+        is_builtin_tool: bool,
         call_id: String,
         tool_name: String,
         args_json_str: String,
@@ -96,7 +97,55 @@ impl ToolLoopState {
         self.conversation_history.push(output_item);
 
         self.mcp_call_items.push(transformed_item);
+
+        if is_builtin_tool {
+            let openai_output_items = extract_openai_response_output_items(&output_str);
+            if !openai_output_items.is_empty() {
+                debug!(
+                    call_id = %call_id,
+                    extracted_items = openai_output_items.len(),
+                    "Extracted intermediary OpenAI response items from MCP tool output"
+                );
+                self.mcp_call_items.extend(openai_output_items);
+            }
+        }
     }
+}
+
+fn extract_openai_response_output_items(output_str: &str) -> Vec<Value> {
+    let result = match serde_json::from_str::<Value>(output_str) {
+        Ok(value) => value,
+        _ => return Vec::new(),
+    };
+
+    extract_embedded_openai_responses(&result)
+        .into_iter()
+        .filter_map(build_message_from_openai_response)
+        .collect()
+}
+
+fn build_message_from_openai_response(openai_response: Value) -> Option<Value> {
+    let obj = openai_response.as_object()?;
+
+    let content_value = obj.get("content")?;
+
+    let content = match content_value {
+        Value::Array(items) => items.clone(),
+        Value::Object(_) => vec![content_value.clone()],
+        _ => return None,
+    };
+
+    if content.is_empty() {
+        return None;
+    }
+
+    Some(json!({
+        "id": generate_id("msg"),
+        "type": "message",
+        "status": "completed",
+        "role": "assistant",
+        "content": content
+    }))
 }
 
 /// Execute detected tool calls and send completion events to client
@@ -162,6 +211,7 @@ pub(crate) async fn execute_streaming_tool_calls(
                     return false;
                 }
                 state.record_call(
+                    session.is_builtin_tool(&call.name),
                     call.call_id,
                     call.name,
                     call.arguments_buffer,
@@ -219,6 +269,7 @@ pub(crate) async fn execute_streaming_tool_calls(
         }
 
         state.record_call(
+            session.is_builtin_tool(&call.name),
             call.call_id,
             call.name,
             call.arguments_buffer,
@@ -716,6 +767,7 @@ pub(crate) async fn execute_tool_loop(
                     );
 
                     state.record_call(
+                        session.is_builtin_tool(&call.name),
                         call.call_id,
                         call.name,
                         call.arguments,
@@ -767,6 +819,7 @@ pub(crate) async fn execute_tool_loop(
             );
 
             state.record_call(
+                session.is_builtin_tool(&call.name),
                 call.call_id,
                 call.name,
                 call.arguments,
@@ -1020,8 +1073,9 @@ mod tests {
     };
 
     use super::{
-        build_transformed_mcp_call_item, is_internal_mcp_response_item,
-        mcp_list_tools_bindings_to_emit,
+        build_transformed_mcp_call_item, extract_openai_response_output_items,
+        is_internal_mcp_response_item, mcp_list_tools_bindings_to_emit, ResponseInput,
+        ToolLoopState,
     };
 
     fn test_tool(name: &str) -> Tool {
@@ -1213,5 +1267,117 @@ mod tests {
             bindings_to_emit,
             vec![("deepwiki_ask".to_string(), "server-ask".to_string())]
         );
+    }
+
+    #[test]
+    fn extract_openai_response_output_items_from_embedded_text_json() {
+        let output = r#"[{"type":"text","text":"{\"execution_id\":\"abc\",\"openai_response\":{\"content\":{\"type\":\"output_text\",\"annotations\":[{\"type\":\"url_citation\",\"title\":\"Example citation\",\"url\":\"https://example.com/openai-result\",\"start_index\":0,\"end_index\":10}],\"logprobs\":[],\"text\":\"intermediate summary\"}}}"}]"#;
+
+        let extracted = extract_openai_response_output_items(output);
+        assert_eq!(extracted.len(), 1);
+        assert_eq!(extracted[0]["type"], "message");
+        assert_eq!(extracted[0]["role"], "assistant");
+        assert_eq!(extracted[0]["content"][0]["type"], "output_text");
+        assert_eq!(extracted[0]["content"][0]["text"], "intermediate summary");
+        assert_eq!(
+            extracted[0]["content"][0]["annotations"][0]["type"],
+            "url_citation"
+        );
+        assert_eq!(
+            extracted[0]["content"][0]["annotations"][0]["title"],
+            "Example citation"
+        );
+        assert_eq!(
+            extracted[0]["content"][0]["annotations"][0]["url"],
+            "https://example.com/openai-result"
+        );
+        assert_eq!(
+            extracted[0]["content"][0]["annotations"][0]["start_index"],
+            0
+        );
+        assert_eq!(
+            extracted[0]["content"][0]["annotations"][0]["end_index"],
+            10
+        );
+    }
+
+    #[test]
+    fn record_call_appends_openai_response_output_after_tool_item() {
+        let mut state = ToolLoopState::new(ResponseInput::Text("hello".to_string()), Vec::new());
+        let transformed = json!({
+            "type": "web_search_call",
+            "id": "ws_test",
+            "status": "completed",
+            "action": {"type": "search"}
+        });
+        let output = r#"[{"type":"text","text":"{\"openai_response\":{\"content\":{\"type\":\"output_text\",\"annotations\":[{\"type\":\"url_citation\",\"title\":\"Example citation\",\"url\":\"https://example.com/openai-result\",\"start_index\":0,\"end_index\":10}],\"logprobs\":[],\"text\":\"intermediate\"}}}"}]"#;
+
+        state.record_call(
+            true,
+            "call_123".to_string(),
+            "search_web".to_string(),
+            "{\"query\":\"x\"}".to_string(),
+            output.to_string(),
+            transformed,
+        );
+
+        assert_eq!(state.mcp_call_items.len(), 2);
+        assert_eq!(state.mcp_call_items[0]["type"], "web_search_call");
+        assert_eq!(state.mcp_call_items[1]["type"], "message");
+        assert_eq!(
+            state.mcp_call_items[1]["content"][0]["text"],
+            "intermediate"
+        );
+        assert_eq!(
+            state.mcp_call_items[1]["content"][0]["annotations"][0]["type"],
+            "url_citation"
+        );
+        assert_eq!(
+            state.mcp_call_items[1]["content"][0]["annotations"][0]["title"],
+            "Example citation"
+        );
+        assert_eq!(
+            state.mcp_call_items[1]["content"][0]["annotations"][0]["url"],
+            "https://example.com/openai-result"
+        );
+        assert_eq!(
+            state.mcp_call_items[1]["content"][0]["annotations"][0]["start_index"],
+            0
+        );
+        assert_eq!(
+            state.mcp_call_items[1]["content"][0]["annotations"][0]["end_index"],
+            10
+        );
+    }
+
+    #[test]
+    fn record_call_does_not_append_openai_response_output_for_non_builtin_tools() {
+        let mut state = ToolLoopState::new(ResponseInput::Text("hello".to_string()), Vec::new());
+        let transformed = json!({
+            "type": "web_search_call",
+            "id": "ws_test",
+            "status": "completed",
+            "action": {"type": "search"}
+        });
+        let output = r#"[{"type":"text","text":"{\"openai_response\":{\"content\":{\"type\":\"output_text\",\"annotations\":[],\"logprobs\":[],\"text\":\"intermediate\"}}}"}]"#;
+
+        state.record_call(
+            false,
+            "call_123".to_string(),
+            "internal_search_web".to_string(),
+            "{\"query\":\"x\"}".to_string(),
+            output.to_string(),
+            transformed,
+        );
+
+        assert_eq!(state.mcp_call_items.len(), 1);
+        assert_eq!(state.mcp_call_items[0]["type"], "web_search_call");
+    }
+
+    #[test]
+    fn extract_openai_response_output_items_ignores_null_openai_response() {
+        let output = r#"[{"type":"text","text":"{\"openai_response\":null}"}]"#;
+        let extracted = extract_openai_response_output_items(output);
+        assert!(extracted.is_empty());
     }
 }
