@@ -88,7 +88,7 @@ pub fn chunk_value(
             generation,
             chunk_index: 0,
             total_chunks: 1,
-            data: value.to_vec(),
+            data: value,
         }];
     }
 
@@ -108,7 +108,7 @@ pub fn chunk_value(
             generation,
             chunk_index: index as u32,
             total_chunks: total_chunks as u32,
-            data: value.slice(start..end).to_vec(),
+            data: value.slice(start..end),
         });
     }
     entries
@@ -119,22 +119,31 @@ pub fn chunk_value(
 /// in the chunk assembler. Multi-chunk entries route through the
 /// assembler and fire subscribers only on full reassembly.
 ///
-/// Takes ownership of the entries so chunk payloads move into `Bytes`
-/// without cloning. The chunk assembler scopes in-flight state by
-/// `peer_id` so concurrent chunked values from different senders under
-/// the same key don't collide.
+/// Each chunk payload is detached from the decoded `StreamBatch`
+/// buffer via `Bytes::copy_from_slice` before it's stored or
+/// forwarded. Without this, the prost-generated `StreamEntry.data`
+/// is a `Bytes` view into the message frame, so a single pinned
+/// chunk (in the assembler or in a subscriber queue) would retain
+/// the entire batch allocation. That would let a peer packing many
+/// tiny entries into near-`MAX_MESSAGE_SIZE` batches defeat both
+/// `DEFAULT_MAX_ASSEMBLER_BYTES` and subscriber backpressure.
+///
+/// The chunk assembler scopes in-flight state by `peer_id` so
+/// concurrent chunked values from different senders under the same
+/// key don't collide.
 pub fn dispatch_stream_batch(
     mesh_kv: &MeshKV,
     peer_id: &str,
     entries: impl IntoIterator<Item = StreamEntry>,
 ) {
     for entry in entries {
+        let data = Bytes::copy_from_slice(&entry.data);
         if entry.total_chunks == 1 {
             // A fresh single-chunk value supersedes any in-flight
             // multi-chunk assembly for the same (peer, key); drop the
             // stale fragments so they don't wait for GC.
             mesh_kv.chunk_assembler().drop_pending(peer_id, &entry.key);
-            mesh_kv.notify_subscribers(&entry.key, Some(vec![Bytes::from(entry.data)]));
+            mesh_kv.notify_subscribers(&entry.key, Some(vec![data]));
         } else {
             let key = entry.key.clone();
             if let Some(fragments) = mesh_kv.chunk_assembler().receive_chunk(
@@ -143,7 +152,7 @@ pub fn dispatch_stream_batch(
                 entry.generation,
                 entry.chunk_index,
                 entry.total_chunks,
-                entry.data,
+                data,
             ) {
                 mesh_kv.notify_subscribers(&key, Some(fragments));
             }
@@ -316,14 +325,14 @@ mod tests {
                 generation: 1,
                 chunk_index: 0,
                 total_chunks: 1,
-                data: vec![1],
+                data: Bytes::from_static(&[1]),
             },
             StreamEntry {
                 key: "b".into(),
                 generation: 1,
                 chunk_index: 0,
                 total_chunks: 1,
-                data: vec![2],
+                data: Bytes::from_static(&[2]),
             },
         ];
         let batches = build_stream_batches(entries, 5, 1024);
@@ -339,7 +348,7 @@ mod tests {
                 generation: 1,
                 chunk_index: 0,
                 total_chunks: 1,
-                data: vec![i as u8],
+                data: Bytes::copy_from_slice(&[i as u8]),
             })
             .collect();
         // 10 entries, cap=3 → 3 + 3 + 3 + 1 = 4 batches. No entry dropped.
@@ -364,7 +373,7 @@ mod tests {
                 generation: 1,
                 chunk_index: 0,
                 total_chunks: 1,
-                data: vec![0u8; 100],
+                data: Bytes::from(vec![0u8; 100]),
             })
             .collect();
         let batches = build_stream_batches(entries, 10, 250);
@@ -383,7 +392,7 @@ mod tests {
             generation: 1,
             chunk_index: 0,
             total_chunks: 1,
-            data: vec![0u8; 500],
+            data: Bytes::from(vec![0u8; 500]),
         }];
         let batches = build_stream_batches(entries, 10, 100);
         assert_eq!(batches.len(), 1);
@@ -401,7 +410,7 @@ mod tests {
             generation: 1,
             chunk_index: 0,
             total_chunks: 1,
-            data: vec![1],
+            data: Bytes::from_static(&[1]),
         }];
         let out = build_stream_batches(entries, 0, 1024);
         assert!(out.is_empty());
@@ -415,7 +424,7 @@ mod tests {
             generation: 1,
             chunk_index: 0,
             total_chunks: 1,
-            data: vec![1],
+            data: Bytes::from_static(&[1]),
         }];
         let out = build_stream_batches(entries, 5, 0);
         assert!(out.is_empty());
