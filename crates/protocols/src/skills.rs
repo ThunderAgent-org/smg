@@ -8,6 +8,9 @@ use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
 };
 use serde_json::{Map, Value};
+use validator::Validate;
+
+use crate::validated::Normalizable;
 
 /// Multipart field carrying the explicit admin target tenant id.
 pub const SKILLS_MULTIPART_TENANT_ID_FIELD: &str = "tenant_id";
@@ -175,6 +178,24 @@ pub struct SkillMutationResponse {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<SkillWarningResponse>,
 }
+
+/// JSON body accepted by `PATCH /v1/skills/{skill_id}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Validate, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SkillPatchRequest {
+    pub default_version: SkillVersionRef,
+}
+
+impl Normalizable for SkillPatchRequest {}
+
+/// JSON body accepted by `PATCH /v1/skills/{skill_id}/versions/{version}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Validate, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SkillVersionPatchRequest {
+    pub deprecated: bool,
+}
+
+impl Normalizable for SkillVersionPatchRequest {}
 
 /// Query parameters accepted by `GET /v1/skills`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, schemars::JsonSchema)]

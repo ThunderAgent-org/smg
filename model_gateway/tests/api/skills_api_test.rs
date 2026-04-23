@@ -157,6 +157,31 @@ async fn create_skill_version_via_api(
     response.json().await.expect("json response")
 }
 
+fn extract_etag(response: &reqwest::Response) -> String {
+    response
+        .headers()
+        .get(reqwest::header::ETAG)
+        .expect("etag header")
+        .to_str()
+        .expect("etag text")
+        .to_string()
+}
+
+async fn assert_if_none_match_status(
+    request: reqwest::RequestBuilder,
+    etag: &str,
+    expected_status: reqwest::StatusCode,
+) {
+    let if_none_match = request
+        .try_clone()
+        .expect("clone request builder for etag")
+        .header(reqwest::header::IF_NONE_MATCH, etag)
+        .send()
+        .await
+        .expect("send If-None-Match request");
+    assert_eq!(if_none_match.status(), expected_status);
+}
+
 #[tokio::test]
 async fn create_skill_returns_created_skill_and_version() {
     let blob_dir = tempfile::tempdir().expect("blob tempdir");
@@ -665,6 +690,357 @@ async fn invalid_after_cursor_returns_bad_request_before_conditional_cache_check
         invalid_versions_body["error"]["code"],
         "invalid_after_cursor"
     );
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn patch_skill_and_version_endpoints_update_default_and_deprecated_state() {
+    let blob_dir = tempfile::tempdir().expect("blob tempdir");
+    let cache_dir = tempfile::tempdir().expect("cache tempdir");
+    let app = create_skills_test_app(skills_test_config(&blob_dir, &cache_dir, true)).await;
+    let (base_url, server) = spawn_app(app).await;
+    let client = reqwest::Client::new();
+
+    let created = create_skill_via_api(
+        &client,
+        &base_url,
+        "tenant-a",
+        b"---\nname: acme:map\ndescription: Map the repo\n---\nUse rg.",
+    )
+    .await;
+    let skill_id = created["skill"]["id"]
+        .as_str()
+        .expect("skill id")
+        .to_string();
+    let second = create_skill_version_via_api(
+        &client,
+        &base_url,
+        "tenant-a",
+        &skill_id,
+        b"---\nname: acme:search\ndescription: Search the repo\n---\nUse fd.",
+    )
+    .await;
+    let skill_get = client
+        .get(format!("{base_url}/v1/skills/{skill_id}"))
+        .bearer_auth("test-admin-key")
+        .query(&[("tenant_id", "tenant-a")])
+        .send()
+        .await
+        .expect("send initial get skill request");
+    assert_eq!(skill_get.status(), reqwest::StatusCode::OK);
+    let skill_etag = extract_etag(&skill_get);
+    let _: Value = skill_get.json().await.expect("json response");
+    assert_if_none_match_status(
+        client
+            .get(format!("{base_url}/v1/skills/{skill_id}"))
+            .bearer_auth("test-admin-key")
+            .query(&[("tenant_id", "tenant-a")]),
+        &skill_etag,
+        reqwest::StatusCode::NOT_MODIFIED,
+    )
+    .await;
+
+    let patch_skill = client
+        .patch(format!("{base_url}/v1/skills/{skill_id}"))
+        .bearer_auth("test-admin-key")
+        .query(&[("tenant_id", "tenant-a")])
+        .json(&serde_json::json!({
+            "default_version": 2
+        }))
+        .send()
+        .await
+        .expect("send patch skill request");
+    assert_eq!(patch_skill.status(), reqwest::StatusCode::OK);
+    let patched_skill: Value = patch_skill.json().await.expect("json response");
+    assert_eq!(
+        patched_skill["default_version"],
+        second["version"]["version"]
+    );
+    assert_eq!(patched_skill["name"], "acme:search");
+    assert_if_none_match_status(
+        client
+            .get(format!("{base_url}/v1/skills/{skill_id}"))
+            .bearer_auth("test-admin-key")
+            .query(&[("tenant_id", "tenant-a")]),
+        &skill_etag,
+        reqwest::StatusCode::OK,
+    )
+    .await;
+
+    let versions_before_patch = client
+        .get(format!("{base_url}/v1/skills/{skill_id}/versions"))
+        .bearer_auth("test-admin-key")
+        .query(&[("tenant_id", "tenant-a")])
+        .send()
+        .await
+        .expect("send pre-patch list versions request");
+    assert_eq!(versions_before_patch.status(), reqwest::StatusCode::OK);
+    let versions_etag = extract_etag(&versions_before_patch);
+    let _: Value = versions_before_patch.json().await.expect("json response");
+    assert_if_none_match_status(
+        client
+            .get(format!("{base_url}/v1/skills/{skill_id}/versions"))
+            .bearer_auth("test-admin-key")
+            .query(&[("tenant_id", "tenant-a")]),
+        &versions_etag,
+        reqwest::StatusCode::NOT_MODIFIED,
+    )
+    .await;
+
+    let patch_version = client
+        .patch(format!(
+            "{base_url}/v1/skills/{skill_id}/versions/{}",
+            second["version"]["version"].as_str().expect("version id")
+        ))
+        .bearer_auth("test-admin-key")
+        .query(&[("tenant_id", "tenant-a")])
+        .json(&serde_json::json!({
+            "deprecated": true
+        }))
+        .send()
+        .await
+        .expect("send patch skill version request");
+    assert_eq!(patch_version.status(), reqwest::StatusCode::OK);
+    let patched_version: Value = patch_version.json().await.expect("json response");
+    assert_eq!(patched_version["deprecated"], true);
+    assert_if_none_match_status(
+        client
+            .get(format!("{base_url}/v1/skills/{skill_id}/versions"))
+            .bearer_auth("test-admin-key")
+            .query(&[("tenant_id", "tenant-a")]),
+        &versions_etag,
+        reqwest::StatusCode::OK,
+    )
+    .await;
+
+    let list_versions = client
+        .get(format!("{base_url}/v1/skills/{skill_id}/versions"))
+        .bearer_auth("test-admin-key")
+        .query(&[("tenant_id", "tenant-a")])
+        .send()
+        .await
+        .expect("send list versions request");
+    assert_eq!(list_versions.status(), reqwest::StatusCode::OK);
+    let versions_body: Value = list_versions.json().await.expect("json response");
+    assert_eq!(versions_body["data"].as_array().map(Vec::len), Some(1));
+    assert_eq!(versions_body["data"][0]["version_number"], 1);
+
+    let include_deprecated = client
+        .get(format!("{base_url}/v1/skills/{skill_id}/versions"))
+        .bearer_auth("test-admin-key")
+        .query(&[("tenant_id", "tenant-a"), ("include_deprecated", "true")])
+        .send()
+        .await
+        .expect("send list versions include deprecated request");
+    assert_eq!(include_deprecated.status(), reqwest::StatusCode::OK);
+    let include_body: Value = include_deprecated.json().await.expect("json response");
+    assert_eq!(include_body["data"].as_array().map(Vec::len), Some(2));
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn delete_skill_version_and_skill_endpoints_enforce_default_and_cascade_rules() {
+    let blob_dir = tempfile::tempdir().expect("blob tempdir");
+    let cache_dir = tempfile::tempdir().expect("cache tempdir");
+    let app = create_skills_test_app(skills_test_config(&blob_dir, &cache_dir, true)).await;
+    let (base_url, server) = spawn_app(app).await;
+    let client = reqwest::Client::new();
+
+    let created = create_skill_via_api(
+        &client,
+        &base_url,
+        "tenant-a",
+        b"---\nname: acme:map\ndescription: Map the repo\n---\nUse rg.",
+    )
+    .await;
+    let skill_id = created["skill"]["id"]
+        .as_str()
+        .expect("skill id")
+        .to_string();
+    let second = create_skill_version_via_api(
+        &client,
+        &base_url,
+        "tenant-a",
+        &skill_id,
+        b"---\nname: acme:search\ndescription: Search the repo\n---\nUse fd.",
+    )
+    .await;
+
+    let delete_default = client
+        .delete(format!(
+            "{base_url}/v1/skills/{skill_id}/versions/{}",
+            created["version"]["version"]
+                .as_str()
+                .expect("default version id")
+        ))
+        .bearer_auth("test-admin-key")
+        .query(&[("tenant_id", "tenant-a")])
+        .send()
+        .await
+        .expect("send delete default version request");
+    assert_eq!(delete_default.status(), reqwest::StatusCode::CONFLICT);
+    let delete_default_body: Value = delete_default.json().await.expect("json response");
+    assert_eq!(
+        delete_default_body["error"]["code"],
+        "default_version_conflict"
+    );
+
+    let patch_skill = client
+        .patch(format!("{base_url}/v1/skills/{skill_id}"))
+        .bearer_auth("test-admin-key")
+        .query(&[("tenant_id", "tenant-a")])
+        .json(&serde_json::json!({
+            "default_version": second["version"]["version"]
+        }))
+        .send()
+        .await
+        .expect("send patch skill request");
+    assert_eq!(patch_skill.status(), reqwest::StatusCode::OK);
+
+    let skill_before_delete = client
+        .get(format!("{base_url}/v1/skills/{skill_id}"))
+        .bearer_auth("test-admin-key")
+        .query(&[("tenant_id", "tenant-a")])
+        .send()
+        .await
+        .expect("send get skill before delete request");
+    assert_eq!(skill_before_delete.status(), reqwest::StatusCode::OK);
+    let skill_etag = extract_etag(&skill_before_delete);
+    let _: Value = skill_before_delete.json().await.expect("json response");
+    assert_if_none_match_status(
+        client
+            .get(format!("{base_url}/v1/skills/{skill_id}"))
+            .bearer_auth("test-admin-key")
+            .query(&[("tenant_id", "tenant-a")]),
+        &skill_etag,
+        reqwest::StatusCode::NOT_MODIFIED,
+    )
+    .await;
+
+    let delete_first = client
+        .delete(format!(
+            "{base_url}/v1/skills/{skill_id}/versions/{}",
+            created["version"]["version"]
+                .as_str()
+                .expect("first version id")
+        ))
+        .bearer_auth("test-admin-key")
+        .query(&[("tenant_id", "tenant-a")])
+        .send()
+        .await
+        .expect("send delete first version request");
+    assert_eq!(delete_first.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_if_none_match_status(
+        client
+            .get(format!("{base_url}/v1/skills/{skill_id}"))
+            .bearer_auth("test-admin-key")
+            .query(&[("tenant_id", "tenant-a")]),
+        &skill_etag,
+        reqwest::StatusCode::OK,
+    )
+    .await;
+
+    let get_skill = client
+        .get(format!("{base_url}/v1/skills/{skill_id}"))
+        .bearer_auth("test-admin-key")
+        .query(&[("tenant_id", "tenant-a")])
+        .send()
+        .await
+        .expect("send get skill request");
+    assert_eq!(get_skill.status(), reqwest::StatusCode::OK);
+    let post_delete_skill_etag = extract_etag(&get_skill);
+    let _: Value = get_skill.json().await.expect("json response");
+    assert_if_none_match_status(
+        client
+            .get(format!("{base_url}/v1/skills/{skill_id}"))
+            .bearer_auth("test-admin-key")
+            .query(&[("tenant_id", "tenant-a")]),
+        &post_delete_skill_etag,
+        reqwest::StatusCode::NOT_MODIFIED,
+    )
+    .await;
+
+    let delete_last = client
+        .delete(format!(
+            "{base_url}/v1/skills/{skill_id}/versions/{}",
+            second["version"]["version"]
+                .as_str()
+                .expect("second version id")
+        ))
+        .bearer_auth("test-admin-key")
+        .query(&[("tenant_id", "tenant-a")])
+        .send()
+        .await
+        .expect("send delete last version request");
+    assert_eq!(delete_last.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_if_none_match_status(
+        client
+            .get(format!("{base_url}/v1/skills/{skill_id}"))
+            .bearer_auth("test-admin-key")
+            .query(&[("tenant_id", "tenant-a")]),
+        &post_delete_skill_etag,
+        reqwest::StatusCode::NOT_FOUND,
+    )
+    .await;
+
+    let missing_skill = client
+        .get(format!("{base_url}/v1/skills/{skill_id}"))
+        .bearer_auth("test-admin-key")
+        .query(&[("tenant_id", "tenant-a")])
+        .send()
+        .await
+        .expect("send get missing skill request");
+    assert_eq!(missing_skill.status(), reqwest::StatusCode::NOT_FOUND);
+
+    let created_again = create_skill_via_api(
+        &client,
+        &base_url,
+        "tenant-a",
+        b"---\nname: acme:delete\ndescription: Delete the repo map\n---\nUse rm carefully.",
+    )
+    .await;
+    let list_before_delete = client
+        .get(format!("{base_url}/v1/skills"))
+        .bearer_auth("test-admin-key")
+        .query(&[("tenant_id", "tenant-a")])
+        .send()
+        .await
+        .expect("send list skills before delete request");
+    assert_eq!(list_before_delete.status(), reqwest::StatusCode::OK);
+    let list_etag = extract_etag(&list_before_delete);
+    let _: Value = list_before_delete.json().await.expect("json response");
+    assert_if_none_match_status(
+        client
+            .get(format!("{base_url}/v1/skills"))
+            .bearer_auth("test-admin-key")
+            .query(&[("tenant_id", "tenant-a")]),
+        &list_etag,
+        reqwest::StatusCode::NOT_MODIFIED,
+    )
+    .await;
+
+    let delete_skill = client
+        .delete(format!(
+            "{base_url}/v1/skills/{}",
+            created_again["skill"]["id"].as_str().expect("skill id")
+        ))
+        .bearer_auth("test-admin-key")
+        .query(&[("tenant_id", "tenant-a")])
+        .send()
+        .await
+        .expect("send delete skill request");
+    assert_eq!(delete_skill.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_if_none_match_status(
+        client
+            .get(format!("{base_url}/v1/skills"))
+            .bearer_auth("test-admin-key")
+            .query(&[("tenant_id", "tenant-a")]),
+        &list_etag,
+        reqwest::StatusCode::OK,
+    )
+    .await;
 
     server.abort();
 }
