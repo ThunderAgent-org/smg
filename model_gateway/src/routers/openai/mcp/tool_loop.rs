@@ -466,10 +466,11 @@ fn send_tool_call_intermediate_event(
         ResponseFormat::WebSearchCall => WebSearchCallEvent::SEARCHING,
         ResponseFormat::CodeInterpreterCall => CodeInterpreterCallEvent::INTERPRETING,
         ResponseFormat::FileSearchCall => FileSearchCallEvent::SEARCHING,
-        // stubbed: full event wiring (incl. partial_image payload events) is
-        // implemented in R6.2 for this router. Emitting `generating` as the
-        // generic intermediate keeps the shape consistent with the shared
-        // emitter in `grpc/common/responses/streaming.rs`.
+        // `generating` is the intermediate event for image_generation_call, on
+        // par with `searching` for web/file search and `interpreting` for code.
+        // `partial_image` events are emitted inline by the underlying tool when
+        // it streams preview chunks; the tool_loop path only emits the coarse
+        // in_progress → generating → completed sequence.
         ResponseFormat::ImageGenerationCall => ImageGenerationCallEvent::GENERATING,
         ResponseFormat::Passthrough => return true, // mcp_call has no intermediate event
     };
@@ -491,7 +492,8 @@ fn send_tool_call_intermediate_event(
 }
 
 /// Send tool call completion events after tool execution.
-/// Handles mcp_call, web_search_call, code_interpreter_call, and file_search_call items.
+/// Handles mcp_call, web_search_call, code_interpreter_call, file_search_call,
+/// and image_generation_call items.
 /// Returns false if client disconnected.
 fn send_tool_call_completion_events(
     tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
@@ -559,8 +561,9 @@ fn stable_streaming_tool_item_id(
         ResponseFormat::WebSearchCall => normalize_tool_item_id_with_prefix(source_id, "ws_"),
         ResponseFormat::CodeInterpreterCall => normalize_tool_item_id_with_prefix(source_id, "ci_"),
         ResponseFormat::FileSearchCall => normalize_tool_item_id_with_prefix(source_id, "fs_"),
-        // stubbed: `ig_` prefix matches the shared transformer's output item id
-        // (`to_image_generation_call`). R6.2 wires the full per-router path.
+        // `ig_` prefix mirrors the shared transformer's output item id
+        // (`to_image_generation_call`) and the 2-letter convention used by
+        // the other hosted tool formats.
         ResponseFormat::ImageGenerationCall => normalize_tool_item_id_with_prefix(source_id, "ig_"),
     }
 }
@@ -583,8 +586,6 @@ fn non_streaming_tool_item_id_source(item_id: &str, response_format: &ResponseFo
         ResponseFormat::WebSearchCall
         | ResponseFormat::CodeInterpreterCall
         | ResponseFormat::FileSearchCall
-        // stubbed: image_generation_call shares the fc_/call_ strip behavior
-        // with the other built-ins. R6.2 wires per-router specifics.
         | ResponseFormat::ImageGenerationCall => item_id
             .strip_prefix("fc_")
             .or_else(|| item_id.strip_prefix("call_"))
@@ -1139,7 +1140,8 @@ fn build_mcp_approval_request_item(
 /// Build a transformed output item using ResponseTransformer
 ///
 /// Converts the output using the tool's response_format to the correctly-typed
-/// output item (mcp_call, web_search_call, code_interpreter_call, file_search_call).
+/// output item (mcp_call, web_search_call, code_interpreter_call, file_search_call,
+/// image_generation_call).
 /// Returns the result as a JSON Value for SSE event streaming.
 fn build_transformed_mcp_call_item(
     output: &Value,
