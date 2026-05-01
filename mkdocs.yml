@@ -155,6 +155,7 @@ nav:
           - Tokenization and Parsing APIs: getting-started/tokenization-and-parsing.md
       - Advanced Features:
           - Load Balancing: getting-started/load-balancing.md
+          - ThunderAgent (Program-Aware Routing): getting-started/thunder.md
           - Tokenizer Caching: getting-started/tokenizer-caching.md
           - MCP in Responses API: getting-started/mcp.md
           - External Providers: getting-started/external-providers.md
@@ -168,6 +169,7 @@ nav:
       - Routing:
           - Load Balancing: concepts/routing/load-balancing.md
           - Cache-Aware Routing: concepts/routing/cache-aware.md
+          - ThunderAgent (Program-Aware Routing): concepts/routing/thunder.md
           - PD Disaggregation: concepts/routing/pd-disaggregation.md
       - Performance:
           - Tokenizer Caching: concepts/performance/tokenizer-caching.md
