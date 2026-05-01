@@ -149,7 +149,7 @@ struct CliArgs {
 
     // ==================== Routing Policy ====================
     /// Load balancing policy to use
-    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "Routing Policy")]
+    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "consistent_hashing", "manual", "bucket", "thunder"], help_heading = "Routing Policy")]
     policy: String,
 
     /// Cache threshold (0.0-1.0) for cache-aware routing
@@ -191,6 +191,27 @@ struct CliArgs {
     /// Load factor threshold for prefix_hash policy
     #[arg(long, default_value_t = 1.25, help_heading = "Routing Policy")]
     prefix_hash_load_factor: f64,
+
+    /// Thunder sub-mode selector: "default" (least-active-program-count) or
+    /// "tr" (capacity-gated, P5+; falls back to default until then).
+    #[arg(long, default_value = "default", value_parser = ["default", "tr"], help_heading = "Thunder Policy")]
+    thunder_sub_mode: String,
+
+    /// Reserved fraction of backend capacity (0.0-1.0). P5+ TR-mode gate.
+    #[arg(long, default_value_t = 0.10, help_heading = "Thunder Policy")]
+    thunder_capacity_reserved_fraction: f64,
+
+    /// Wait time when admission blocks (P5+ pause/resume).
+    #[arg(long, default_value_t = 1800, help_heading = "Thunder Policy")]
+    thunder_resume_timeout_secs: u64,
+
+    /// Scheduler tick interval in milliseconds (P6+).
+    #[arg(long, default_value_t = 100, help_heading = "Thunder Policy")]
+    thunder_scheduler_tick_ms: u64,
+
+    /// Period between backend capacity-refresh polls in seconds (P4+).
+    #[arg(long, default_value_t = 5, help_heading = "Thunder Policy")]
+    thunder_capacity_poll_interval_secs: u64,
 
     /// Enable data parallelism aware scheduling
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
@@ -929,6 +950,13 @@ impl CliArgs {
                     "min_group" => ManualAssignmentMode::MinGroup,
                     other => panic!("Unknown assignment mode: {other}"),
                 },
+            },
+            "thunder" => PolicyConfig::Thunder {
+                sub_mode: self.thunder_sub_mode.clone(),
+                capacity_reserved_fraction: self.thunder_capacity_reserved_fraction,
+                resume_timeout_secs: self.thunder_resume_timeout_secs,
+                scheduler_tick_ms: self.thunder_scheduler_tick_ms,
+                capacity_poll_interval_secs: self.thunder_capacity_poll_interval_secs,
             },
             _ => PolicyConfig::RoundRobin,
         }

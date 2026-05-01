@@ -12,6 +12,7 @@ pub(crate) fn route_to_endpoint(route: &str) -> &'static str {
         "/v1/completions" => metrics_labels::ENDPOINT_COMPLETIONS,
         "/v1/rerank" => metrics_labels::ENDPOINT_RERANK,
         "/v1/responses" => metrics_labels::ENDPOINT_RESPONSES,
+        "/v1/messages" => metrics_labels::ENDPOINT_MESSAGES,
         "/v1/audio/transcriptions" => metrics_labels::ENDPOINT_AUDIO_TRANSCRIPTIONS,
         _ => "other",
     }
@@ -25,5 +26,21 @@ pub(crate) fn error_type_from_status(status: StatusCode) -> &'static str {
         408 | 504 => metrics_labels::ERROR_TIMEOUT,
         500..=599 => metrics_labels::ERROR_BACKEND,
         _ => metrics_labels::ERROR_INTERNAL,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn route_to_endpoint_messages_is_messages() {
+        assert_eq!(route_to_endpoint("/v1/messages"), metrics_labels::ENDPOINT_MESSAGES);
+        assert_eq!(route_to_endpoint("/v1/messages"), "messages");
+    }
+
+    #[test]
+    fn route_to_endpoint_unknown_is_other() {
+        assert_eq!(route_to_endpoint("/v1/foo"), "other");
     }
 }

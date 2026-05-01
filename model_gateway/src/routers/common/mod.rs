@@ -23,5 +23,6 @@ pub mod background;
 pub mod header_utils;
 pub mod mcp_utils;
 pub mod persistence_utils;
+pub mod program_id;
 pub mod retry;
 pub mod worker_selection;

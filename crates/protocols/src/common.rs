@@ -46,6 +46,14 @@ pub trait GenerationRequest: Send + Sync {
 
     /// Extract text content for routing decisions
     fn extract_text_for_routing(&self) -> String;
+
+    /// Optional program identifier used by program-aware policies (e.g. Thunder)
+    /// to group requests for capacity tracking and pause/resume scheduling.
+    /// Default returns None; implementers that carry a program_id (e.g.
+    /// `CreateMessageRequest` via `metadata.program_id`) override this.
+    fn program_id_hint(&self) -> Option<&str> {
+        None
+    }
 }
 
 // ============================================================================
@@ -852,5 +860,22 @@ mod tests {
         assert!(ConversationRef::Id(String::new()).is_empty());
         assert!(!ConversationRef::Id("conv_1".to_string()).is_empty());
         assert!(ConversationRef::Object { id: String::new() }.is_empty());
+    }
+
+    #[test]
+    fn program_id_hint_default_returns_none() {
+        struct Stub;
+        impl GenerationRequest for Stub {
+            fn is_stream(&self) -> bool {
+                false
+            }
+            fn get_model(&self) -> Option<&str> {
+                None
+            }
+            fn extract_text_for_routing(&self) -> String {
+                String::new()
+            }
+        }
+        assert_eq!(Stub.program_id_hint(), None);
     }
 }

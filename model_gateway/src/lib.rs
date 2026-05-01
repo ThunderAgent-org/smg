@@ -8,6 +8,7 @@ pub mod policies;
 pub mod routers;
 pub mod server;
 pub mod service_discovery;
+pub mod sse;
 pub mod tenant;
 pub mod version;
 pub mod wasm;

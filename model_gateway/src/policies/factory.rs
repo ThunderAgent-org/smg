@@ -5,7 +5,7 @@ use std::sync::Arc;
 use super::{
     BucketConfig, BucketPolicy, CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy,
     LoadBalancingPolicy, ManualConfig, ManualPolicy, PowerOfTwoPolicy, PrefixHashConfig,
-    PrefixHashPolicy, RandomPolicy, RoundRobinPolicy,
+    PrefixHashPolicy, RandomPolicy, RoundRobinPolicy, ThunderPolicy,
 };
 use crate::config::PolicyConfig;
 
@@ -72,6 +72,33 @@ impl PolicyFactory {
                 };
                 Arc::new(PrefixHashPolicy::new(config))
             }
+            PolicyConfig::Thunder {
+                sub_mode,
+                capacity_reserved_fraction,
+                resume_timeout_secs,
+                scheduler_tick_ms,
+                capacity_poll_interval_secs,
+            } => {
+                let sub_mode = match sub_mode.to_lowercase().as_str() {
+                    "default" => super::thunder::ThunderSubMode::Default,
+                    "tr" => super::thunder::ThunderSubMode::Tr,
+                    other => {
+                        tracing::warn!(
+                            value = %other,
+                            "unknown thunder sub_mode, defaulting to 'default'"
+                        );
+                        super::thunder::ThunderSubMode::Default
+                    }
+                };
+                let cfg = super::thunder::ThunderConfig {
+                    sub_mode,
+                    capacity_reserved_fraction: *capacity_reserved_fraction,
+                    resume_timeout_secs: *resume_timeout_secs,
+                    scheduler_tick_ms: *scheduler_tick_ms,
+                    capacity_poll_interval_secs: *capacity_poll_interval_secs,
+                };
+                Arc::new(ThunderPolicy::new(cfg))
+            }
         }
     }
 
@@ -88,6 +115,7 @@ impl PolicyFactory {
                 Some(Arc::new(ConsistentHashingPolicy::new()))
             }
             "prefix_hash" | "prefixhash" => Some(Arc::new(PrefixHashPolicy::with_defaults())),
+            "thunder" => Some(Arc::new(ThunderPolicy::with_defaults())),
             _ => None,
         }
     }
@@ -136,6 +164,15 @@ mod tests {
 
         let policy = PolicyFactory::create_from_config(&PolicyConfig::ConsistentHashing);
         assert_eq!(policy.name(), "consistent_hashing");
+
+        let policy = PolicyFactory::create_from_config(&PolicyConfig::Thunder {
+            sub_mode: "default".to_string(),
+            capacity_reserved_fraction: 0.10,
+            resume_timeout_secs: 1800,
+            scheduler_tick_ms: 100,
+            capacity_poll_interval_secs: 5,
+        });
+        assert_eq!(policy.name(), "thunder");
     }
 
     #[tokio::test]
@@ -154,6 +191,8 @@ mod tests {
         assert!(PolicyFactory::create_by_name("Manual").is_some());
         assert!(PolicyFactory::create_by_name("consistent_hashing").is_some());
         assert!(PolicyFactory::create_by_name("ConsistentHashing").is_some());
+        assert!(PolicyFactory::create_by_name("thunder").is_some());
+        assert!(PolicyFactory::create_by_name("Thunder").is_some());
         assert!(PolicyFactory::create_by_name("unknown").is_none());
     }
 }

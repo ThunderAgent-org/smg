@@ -1,5 +1,7 @@
 use std::{sync::Arc, time::Instant};
 
+use tokio::sync::mpsc::UnboundedSender;
+
 use axum::{
     body::{to_bytes, Body},
     extract::Request,
@@ -15,6 +17,7 @@ use openai_protocol::{
     completion::CompletionRequest,
     embedding::EmbeddingRequest,
     generate::GenerateRequest,
+    messages::CreateMessageRequest,
     rerank::{RerankRequest, RerankResponse, RerankResult},
     responses::ResponsesRequest,
     transcription::{AudioFile, TranscriptionRequest},
@@ -36,10 +39,14 @@ use crate::{
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
-    policies::{PolicyRegistry, SelectWorkerInfo},
+    policies::{
+        PolicyRegistry, ProgramRequestGuard, SelectWorkerInfo, StreamingProgressEvent, UsageEvent,
+    },
+    sse::{self, SseExtractor, SseProtocol, INCREMENTAL_TOKEN_INTERVAL},
     routers::{
         common::{
             header_utils,
+            program_id as common_program_id,
             retry::{is_retryable_status, RetryExecutor},
         },
         error::{self, extract_error_code_from_response},
@@ -48,6 +55,20 @@ use crate::{
     },
     worker::{AttachedBody, ConnectionMode, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType},
 };
+
+/// Thunder-side context handed into `send_typed_request` for streaming requests
+/// when the active policy is `ThunderPolicy`. Owns the `ProgramRequestGuard`
+/// (moves into the streaming spawn closure) plus channel senders for usage and
+/// progress events. Built per-request in `route_typed_request_once`.
+pub(crate) struct ThunderStreamingCtx {
+    pub program_id: String,
+    pub backend_url: String,
+    pub request_text_chars: usize,
+    pub protocol: SseProtocol,
+    pub guard: ProgramRequestGuard,
+    pub usage_tx: UnboundedSender<UsageEvent>,
+    pub progress_tx: UnboundedSender<StreamingProgressEvent>,
+}
 
 /// Regular router that uses injected load balancing policies
 pub struct Router {
@@ -137,11 +158,12 @@ impl Router {
     /// Select worker considering circuit breaker state.
     /// Filters to workers serving the specified model. When model is "unknown"
     /// (generate endpoint without model), considers all HTTP workers.
-    fn select_worker_for_model(
+    async fn select_worker_for_model(
         &self,
         model_id: &str,
         text: Option<&str>,
         headers: Option<&HeaderMap>,
+        program_id: Option<&str>,
     ) -> Option<Arc<dyn Worker>> {
         // UNKNOWN_MODEL_ID means caller didn't specify a model — find any available worker
         let model_filter = if model_id == crate::worker::UNKNOWN_MODEL_ID {
@@ -172,15 +194,20 @@ impl Router {
         // Get cached hash ring for consistent hashing (O(log n) lookup)
         let hash_ring = self.worker_registry.get_hash_ring(model_id);
 
-        let idx = policy.select_worker(
-            &available,
-            &SelectWorkerInfo {
-                request_text: text,
-                tokens: None, // HTTP doesn't have tokens, use gRPC for PrefixHash
-                headers,
-                hash_ring,
-            },
-        )?;
+        let idx = policy
+            .select_worker_async(
+                &available,
+                &SelectWorkerInfo {
+                    request_text: text,
+                    tokens: None, // HTTP doesn't have tokens, use gRPC for PrefixHash
+                    headers,
+                    hash_ring,
+                    program_id,
+                    declared_max_tokens: None,
+                    avoid_backend: None,
+                },
+            )
+            .await?;
 
         // Record worker selection metric (Layer 3)
         Metrics::record_worker_selection(
@@ -287,7 +314,22 @@ impl Router {
         is_stream: bool,
         text: &str,
     ) -> Response {
-        let worker = match self.select_worker_for_model(model_id, Some(text), headers) {
+        // Captured here so we can hand it to ThunderPolicy's usage_consumer
+        // after a successful non-streaming response. `extract` returns
+        // `Option<&str>` borrowed from `typed_req`, so we must materialize
+        // a String before crossing the await boundary.
+        let program_id_owned: Option<String> =
+            common_program_id::extract(typed_req).map(|s| s.to_string());
+
+        let worker = match self
+            .select_worker_for_model(
+                model_id,
+                Some(text),
+                headers,
+                program_id_owned.as_deref(),
+            )
+            .await
+        {
             Some(w) => w,
             None => {
                 // Distinguish "no workers for this model" from "workers exist but unavailable"
@@ -316,6 +358,22 @@ impl Router {
 
         let policy = self.policy_registry.get_policy_or_default(model_id);
 
+        // ★ Phase 5+6: ThunderPolicy admission accounting. We hold a
+        // `ProgramRequestGuard` for the lifetime of this function. On the
+        // happy non-streaming success path the guard's `complete()` is
+        // called below — `usage_consumer` already decrements `in_flight`
+        // when it applies the matching `UsageEvent`. On any other exit
+        // path (error, client cancel, streaming) the guard's `Drop` does
+        // an async fire-and-forget decrement so admission state stays
+        // consistent.
+        //
+        // The downcast is only enabled when policy is exactly Thunder; for
+        // any other policy the guard is `None` and incurs zero cost.
+        let mut thunder_guard = policy
+            .as_any()
+            .downcast_ref::<crate::policies::ThunderPolicy>()
+            .map(|tp| tp.create_guard(program_id_owned.as_deref().unwrap_or("default")));
+
         let load_guard = ["cache_aware", "manual"]
             .contains(&policy.name())
             .then(|| WorkerLoadGuard::new(worker.clone(), headers));
@@ -326,6 +384,31 @@ impl Router {
         inject_trace_context_http(&mut headers_with_trace);
         let headers = Some(&headers_with_trace);
 
+        // M2: build streaming ctx for Thunder-managed streaming requests so the
+        // SSE-aware relay in send_typed_request can extract usage + emit
+        // progress + own the guard. We MOVE the guard out of `thunder_guard`
+        // here so its Drop on streaming spawn end is the canonical cleanup.
+        // Non-streaming preserves the existing post-response complete() path.
+        let thunder_streaming_ctx: Option<ThunderStreamingCtx> = if is_stream {
+            thunder_guard.take().and_then(|guard| {
+                let usage_tx = policy.usage_sender()?.clone();
+                let progress_tx = policy.streaming_progress_sender()?.clone();
+                Some(ThunderStreamingCtx {
+                    program_id: program_id_owned
+                        .clone()
+                        .unwrap_or_else(|| "default".to_string()),
+                    backend_url: worker.url().to_string(),
+                    request_text_chars: text.len(),
+                    protocol: sse::detect_protocol(route),
+                    guard,
+                    usage_tx,
+                    progress_tx,
+                })
+            })
+        } else {
+            None
+        };
+
         let response = self
             .send_typed_request(
                 headers,
@@ -334,6 +417,7 @@ impl Router {
                 worker.as_ref(),
                 is_stream,
                 load_guard,
+                thunder_streaming_ctx,
             )
             .await;
 
@@ -349,6 +433,75 @@ impl Router {
                 metrics_labels::CONNECTION_HTTP,
                 error_type_from_status(status),
             );
+        }
+
+        // -------- Phase 4: non-streaming usage emission --------
+        //
+        // For policies that implement `usage_sender()` (today: ThunderPolicy),
+        // parse `usage` out of the JSON response body and fire-and-forget a
+        // `UsageEvent`. Streaming requests skip this — SSE tail extraction
+        // is deferred per <CLAUDE-AUTONOMOUS-DECISION> D-20.
+        //
+        // We deconstruct the response and rebuild it with the same bytes so
+        // callers see exactly the original payload. `to_bytes` consumes the
+        // body, but the non-streaming branch in `send_typed_request` already
+        // buffered the full body into `Body::from(bytes)` so this is just a
+        // refcount move on the underlying `bytes::Bytes`, not a re-copy.
+        if !is_stream && status.is_success() {
+            if let Some(tx) = policy.usage_sender() {
+                let (parts, body) = response.into_parts();
+                match to_bytes(body, usize::MAX).await {
+                    Ok(buf) => {
+                        if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&buf) {
+                            if let Some(usage) = parsed.get("usage") {
+                                let prompt_tokens = usage
+                                    .get("prompt_tokens")
+                                    .and_then(serde_json::Value::as_u64)
+                                    .unwrap_or(0)
+                                    as u32;
+                                let completion_tokens = usage
+                                    .get("completion_tokens")
+                                    .and_then(serde_json::Value::as_u64)
+                                    .unwrap_or(0)
+                                    as u32;
+                                let total_tokens = prompt_tokens.saturating_add(completion_tokens);
+                                // Fire-and-forget. send() only fails if the
+                                // receiver was dropped (= policy dropped =
+                                // process shutdown), in which case we have no
+                                // useful action.
+                                let _ = tx.send(UsageEvent {
+                                    program_id: program_id_owned,
+                                    backend_url: worker.url().to_string(),
+                                    prompt_tokens,
+                                    completion_tokens,
+                                    total_tokens,
+                                    request_text_chars: text.len(),
+                                    cache_read_input_tokens: None,
+                                        declared_max_tokens: None,
+                                });
+                                // Happy path: usage_consumer will handle
+                                // in_flight decrement. Suppress the guard's
+                                // Drop cleanup so we don't double-decrement.
+                                if let Some(g) = thunder_guard.as_mut() {
+                                    g.complete();
+                                }
+                            }
+                        }
+                        return Response::from_parts(parts, Body::from(buf));
+                    }
+                    Err(e) => {
+                        error!(
+                            "Failed to buffer non-stream response body for usage emission: {e}"
+                        );
+                        // We've already consumed the body — return an error
+                        // rather than a half-empty response.
+                        return error::internal_error(
+                            "read_response_body_failed",
+                            format!("Failed to read response body: {e}"),
+                        );
+                    }
+                }
+            }
         }
 
         response
@@ -572,6 +725,9 @@ impl Router {
                 tokens: None,
                 headers,
                 hash_ring,
+                program_id: None,
+                declared_max_tokens: None,
+                avoid_backend: None,
             },
         ) {
             Some(i) => i,
@@ -832,6 +988,10 @@ impl Router {
     }
 
     // Send typed request directly without conversion
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "internal helper called from one site; threading thunder ctx is cleaner than packaging into a struct that pollutes the caller's locals"
+    )]
     async fn send_typed_request<T: serde::Serialize>(
         &self,
         headers: Option<&HeaderMap>,
@@ -840,6 +1000,7 @@ impl Router {
         worker: &dyn Worker,
         is_stream: bool,
         load_guard: Option<WorkerLoadGuard>,
+        thunder_streaming_ctx: Option<ThunderStreamingCtx>,
     ) -> Response {
         let api_key = worker.api_key().cloned();
         let endpoint_url = worker.endpoint_url(route);
@@ -854,7 +1015,7 @@ impl Router {
             }
         };
 
-        let json_val = match worker.prepare_request(json_val) {
+        let mut json_val = match worker.prepare_request(json_val) {
             Ok(prepared) => prepared,
             Err(e) => {
                 return error::bad_request(
@@ -863,6 +1024,40 @@ impl Router {
                 );
             }
         };
+
+        // M2: For Thunder streaming requests on OpenAI Chat protocol, force
+        // `stream_options.include_usage=true` so the upstream emits a usage
+        // chunk we can extract. Track whether the client originally asked
+        // for usage so we know whether to strip the chunk before forwarding
+        // to the client (transparent rewrite).
+        let strip_usage_chunk =
+            if let Some(ctx) = thunder_streaming_ctx.as_ref() {
+                if matches!(ctx.protocol, SseProtocol::OpenAiChat) && is_stream {
+                    let originally_asked = json_val
+                        .get("stream_options")
+                        .and_then(|s| s.get("include_usage"))
+                        .map(|v| v == &serde_json::json!(true))
+                        .unwrap_or(false);
+                    let opts = json_val
+                        .as_object_mut()
+                        .and_then(|m| {
+                            m.entry("stream_options".to_string())
+                                .or_insert_with(|| serde_json::json!({}))
+                                .as_object_mut()
+                        });
+                    if let Some(o) = opts {
+                        o.insert(
+                            "include_usage".to_string(),
+                            serde_json::json!(true),
+                        );
+                    }
+                    !originally_asked
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
 
         let mut request_builder = self.client.post(&endpoint_url).json(&json_val);
 
@@ -908,27 +1103,138 @@ impl Router {
             let stream = res.bytes_stream();
             let (tx, rx) = mpsc::unbounded_channel();
 
-            // Spawn task to forward stream
+            // M2 Gap6: if we have Thunder ctx, run an SSE-aware relay that
+            // (a) extracts usage at stream end and emits UsageEvent,
+            // (b) emits incremental StreamingProgressEvent every ~20 tokens,
+            // (c) optionally strips the OpenAI Chat usage chunk before
+            //     forwarding (when client didn't ask for it),
+            // (d) holds the ProgramRequestGuard for the spawn lifetime so
+            //     mid-stream client disconnect triggers M1's Drop fallback.
+            // Otherwise: fall back to the byte-verbatim relay.
             #[expect(
                 clippy::disallowed_methods,
                 reason = "fire-and-forget stream relay; gateway shutdown need not wait for individual stream forwarding"
             )]
-            tokio::spawn(async move {
-                let mut stream = stream;
-                while let Some(chunk) = stream.next().await {
-                    match chunk {
-                        Ok(bytes) => {
-                            if tx.send(Ok(bytes)).is_err() {
+            if let Some(ctx) = thunder_streaming_ctx {
+                let ThunderStreamingCtx {
+                    program_id,
+                    backend_url,
+                    request_text_chars,
+                    protocol,
+                    mut guard,
+                    usage_tx,
+                    progress_tx,
+                } = ctx;
+                let mut extractor = SseExtractor::new(protocol, strip_usage_chunk);
+                tokio::spawn(async move {
+                    let mut stream = stream;
+                    let mut tokens_since_last_progress: u64 = 0;
+                    let send_progress = |delta: u64| {
+                        let _ = progress_tx.send(StreamingProgressEvent {
+                            program_id: program_id.clone(),
+                            delta_tokens: delta,
+                        });
+                    };
+                    while let Some(chunk) = stream.next().await {
+                        match chunk {
+                            Ok(bytes) => {
+                                let parsed = extractor.feed(&bytes);
+                                if !parsed.forward.is_empty()
+                                    && tx.send(Ok(bytes::Bytes::from(parsed.forward))).is_err()
+                                {
+                                    break;
+                                }
+                                tokens_since_last_progress = tokens_since_last_progress
+                                    .saturating_add(parsed.token_delta);
+                                if tokens_since_last_progress >= INCREMENTAL_TOKEN_INTERVAL {
+                                    send_progress(tokens_since_last_progress);
+                                    tokens_since_last_progress = 0;
+                                }
+                                if let Some(usage) = parsed.usage {
+                                    let prompt_tokens =
+                                        usage.prompt_tokens.unwrap_or(0).min(u32::MAX as u64) as u32;
+                                    let completion_tokens = usage
+                                        .completion_tokens
+                                        .unwrap_or(0)
+                                        .min(u32::MAX as u64)
+                                        as u32;
+                                    let total_tokens =
+                                        usage.total_tokens.min(u32::MAX as u64) as u32;
+                                    let cache_read = usage
+                                        .cached_tokens
+                                        .map(|t| t.min(u32::MAX as u64) as u32);
+                                    let _ = usage_tx.send(UsageEvent {
+                                        program_id: Some(program_id.clone()),
+                                        backend_url: backend_url.clone(),
+                                        prompt_tokens,
+                                        completion_tokens,
+                                        total_tokens,
+                                        request_text_chars,
+                                        cache_read_input_tokens: cache_read,
+                                        declared_max_tokens: None,
+                                    });
+                                    guard.complete();
+                                    if tokens_since_last_progress > 0 {
+                                        send_progress(tokens_since_last_progress);
+                                        tokens_since_last_progress = 0;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let _ = tx.send(Err(format!("Stream error: {e}")));
                                 break;
                             }
                         }
-                        Err(e) => {
-                            let _ = tx.send(Err(format!("Stream error: {e}")));
-                            break;
+                    }
+                    // Flush trailing buffer.
+                    let final_parsed = extractor.flush();
+                    if !final_parsed.forward.is_empty() {
+                        let _ = tx.send(Ok(bytes::Bytes::from(final_parsed.forward)));
+                    }
+                    if let Some(usage) = final_parsed.usage {
+                        let prompt_tokens =
+                            usage.prompt_tokens.unwrap_or(0).min(u32::MAX as u64) as u32;
+                        let completion_tokens =
+                            usage.completion_tokens.unwrap_or(0).min(u32::MAX as u64) as u32;
+                        let total_tokens = usage.total_tokens.min(u32::MAX as u64) as u32;
+                        let cache_read = usage.cached_tokens.map(|t| t.min(u32::MAX as u64) as u32);
+                        let _ = usage_tx.send(UsageEvent {
+                            program_id: Some(program_id.clone()),
+                            backend_url: backend_url.clone(),
+                            prompt_tokens,
+                            completion_tokens,
+                            total_tokens,
+                            request_text_chars,
+                            cache_read_input_tokens: cache_read,
+                                        declared_max_tokens: None,
+                        });
+                        guard.complete();
+                    }
+                    if tokens_since_last_progress > 0 {
+                        send_progress(tokens_since_last_progress);
+                    }
+                    // guard dropped here. If complete() was called → no-op.
+                    // Else → M1 fallback un-reserves and decrements in_flight.
+                });
+            } else {
+                // Non-Thunder path: byte-verbatim relay (preserves prior behavior).
+                tokio::spawn(async move {
+                    let mut stream = stream;
+                    while let Some(chunk) = stream.next().await {
+                        match chunk {
+                            Ok(bytes) => {
+                                if tx.send(Ok(bytes)).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                let _ = tx.send(Err(format!("Stream error: {e}")));
+                                break;
+                            }
                         }
                     }
-                }
-            });
+                });
+            }
 
             let stream = UnboundedReceiverStream::new(rx);
             let body = Body::from_stream(stream);
@@ -1147,6 +1453,17 @@ impl RouterTrait for Router {
             .await
     }
 
+    async fn route_messages(
+        &self,
+        headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
+        body: &CreateMessageRequest,
+        model_id: &str,
+    ) -> Response {
+        self.route_typed_request(headers, body, "/v1/messages", model_id)
+            .await
+    }
+
     async fn cancel_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response {
         let endpoint = format!("v1/responses/{response_id}/cancel");
         self.route_post_empty_request(headers, &endpoint).await
@@ -1301,5 +1618,13 @@ mod tests {
 
         let worker = router.worker_registry.get_by_url(&url).unwrap();
         assert!(worker.is_healthy());
+    }
+
+    #[test]
+    fn route_messages_compiles_with_create_message_request() {
+        // Compile-time assertion: route_typed_request accepts CreateMessageRequest.
+        // (Real e2e covered by e2e_test/thunder/test_phase0_messages_passthrough.py.)
+        fn _assert_bounds<T: GenerationRequest + serde::Serialize + Clone + Send + Sync>() {}
+        _assert_bounds::<CreateMessageRequest>();
     }
 }

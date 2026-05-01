@@ -466,6 +466,43 @@ impl ConfigValidator {
                     });
                 }
             }
+            PolicyConfig::Thunder {
+                sub_mode,
+                capacity_reserved_fraction,
+                resume_timeout_secs: _,
+                scheduler_tick_ms,
+                capacity_poll_interval_secs,
+            } => {
+                let sm = sub_mode.to_lowercase();
+                if sm != "default" && sm != "tr" {
+                    return Err(ConfigError::InvalidValue {
+                        field: "thunder.sub_mode".to_string(),
+                        value: sub_mode.clone(),
+                        reason: "Must be 'default' or 'tr'".to_string(),
+                    });
+                }
+                if !(0.0..=1.0).contains(capacity_reserved_fraction) {
+                    return Err(ConfigError::InvalidValue {
+                        field: "thunder.capacity_reserved_fraction".to_string(),
+                        value: capacity_reserved_fraction.to_string(),
+                        reason: "Must be between 0.0 and 1.0".to_string(),
+                    });
+                }
+                if *scheduler_tick_ms == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "thunder.scheduler_tick_ms".to_string(),
+                        value: scheduler_tick_ms.to_string(),
+                        reason: "Must be > 0".to_string(),
+                    });
+                }
+                if *capacity_poll_interval_secs == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "thunder.capacity_poll_interval_secs".to_string(),
+                        value: capacity_poll_interval_secs.to_string(),
+                        reason: "Must be > 0".to_string(),
+                    });
+                }
+            }
         }
         Ok(())
     }

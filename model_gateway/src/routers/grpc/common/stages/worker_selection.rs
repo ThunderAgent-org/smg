@@ -11,8 +11,9 @@ use crate::{
     observability::metrics::{metrics_labels, Metrics},
     policies::{PolicyRegistry, SelectWorkerInfo},
     routers::{
+        common::program_id as common_program_id,
         error,
-        grpc::context::{RequestContext, WorkerSelection},
+        grpc::context::{RequestContext, RequestType, WorkerSelection},
     },
     worker::{ConnectionMode, RuntimeType, Worker, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID},
 };
@@ -73,7 +74,19 @@ impl PipelineStage for WorkerSelectionStage {
         let model_id = ctx.input.model_id.as_str();
         let workers = match self.mode {
             WorkerSelectionMode::Regular => {
-                match self.select_single_worker(model_id, text, tokens, headers) {
+                let program_id = match &ctx.input.request_type {
+                    RequestType::Chat(req) => common_program_id::extract(req.as_ref()),
+                    RequestType::Generate(req) => common_program_id::extract(req.as_ref()),
+                    RequestType::Completion(req) => common_program_id::extract(req.as_ref()),
+                    RequestType::Responses(req) => common_program_id::extract(req.as_ref()),
+                    RequestType::Embedding(req) => common_program_id::extract(req.as_ref()),
+                    RequestType::Classify(req) => common_program_id::extract(req.as_ref()),
+                    RequestType::Messages(req) => common_program_id::extract(req.as_ref()),
+                };
+                match self
+                    .select_single_worker(model_id, text, tokens, headers, program_id)
+                    .await
+                {
                     Some(w) => WorkerSelection::Single { worker: w },
                     None => {
                         error!(
@@ -116,12 +129,13 @@ impl PipelineStage for WorkerSelectionStage {
 }
 
 impl WorkerSelectionStage {
-    fn select_single_worker(
+    async fn select_single_worker(
         &self,
         model_id: &str,
         text: Option<&str>,
         tokens: Option<&[u32]>,
         headers: Option<&http::HeaderMap>,
+        program_id: Option<&str>,
     ) -> Option<Arc<dyn Worker>> {
         // Treat "unknown" model as wildcard (match any worker)
         let model_filter = if model_id == UNKNOWN_MODEL_ID {
@@ -154,15 +168,20 @@ impl WorkerSelectionStage {
         let hash_ring = self.worker_registry.get_hash_ring(model_id);
 
         // Select worker using the policy
-        let idx = policy.select_worker(
-            &available,
-            &SelectWorkerInfo {
-                request_text: text,
-                tokens,
-                headers,
-                hash_ring,
-            },
-        )?;
+        let idx = policy
+            .select_worker_async(
+                &available,
+                &SelectWorkerInfo {
+                    request_text: text,
+                    tokens,
+                    headers,
+                    hash_ring,
+                    program_id,
+                    declared_max_tokens: None,
+            avoid_backend: None,
+                },
+            )
+            .await?;
         let selected = available[idx].clone();
 
         // Record worker selection metric
@@ -272,6 +291,9 @@ impl WorkerSelectionStage {
             tokens,
             headers,
             hash_ring,
+            program_id: None,
+            declared_max_tokens: None,
+            avoid_backend: None,
         };
         let prefill_idx = policy.select_worker(&available_prefill, &info)?;
         let decode_idx = policy.select_worker(&available_decode, &info)?;

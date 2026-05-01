@@ -415,6 +415,28 @@ pub enum PolicyConfig {
         #[serde(default = "default_load_factor")]
         load_factor: f64,
     },
+
+    /// ThunderPolicy: program-aware capacity-tracking routing.
+    /// Phase 3 ships Default sub-mode (least-active-program-count + sticky on
+    /// program_id); TR sub-mode (capacity-gated admission) lands in P5.
+    #[serde(rename = "thunder")]
+    Thunder {
+        /// Sub-mode selector: "default" or "tr" (TR not active until P5).
+        #[serde(default = "default_thunder_sub_mode")]
+        sub_mode: String,
+        /// Reserved fraction of backend capacity (0.0..=1.0, default 0.10).
+        #[serde(default = "default_thunder_capacity_reserved_fraction")]
+        capacity_reserved_fraction: f64,
+        /// Resume-wait timeout in seconds (default 1800 = 30 min).
+        #[serde(default = "default_thunder_resume_timeout_secs")]
+        resume_timeout_secs: u64,
+        /// Scheduler tick interval in milliseconds (default 100).
+        #[serde(default = "default_thunder_scheduler_tick_ms")]
+        scheduler_tick_ms: u64,
+        /// Period between backend capacity-refresh polls in seconds (default 5).
+        #[serde(default = "default_thunder_capacity_poll_interval_secs")]
+        capacity_poll_interval_secs: u64,
+    },
 }
 
 fn default_block_size() -> usize {
@@ -437,6 +459,26 @@ fn default_manual_max_idle_secs() -> u64 {
     4 * 3600
 }
 
+fn default_thunder_sub_mode() -> String {
+    "default".to_string()
+}
+
+fn default_thunder_capacity_reserved_fraction() -> f64 {
+    0.10
+}
+
+fn default_thunder_resume_timeout_secs() -> u64 {
+    1800
+}
+
+fn default_thunder_scheduler_tick_ms() -> u64 {
+    100
+}
+
+fn default_thunder_capacity_poll_interval_secs() -> u64 {
+    5
+}
+
 impl PolicyConfig {
     pub fn name(&self) -> &'static str {
         match self {
@@ -448,6 +490,7 @@ impl PolicyConfig {
             PolicyConfig::Manual { .. } => "manual",
             PolicyConfig::ConsistentHashing => "consistent_hashing",
             PolicyConfig::PrefixHash { .. } => "prefix_hash",
+            PolicyConfig::Thunder { .. } => "thunder",
         }
     }
 }
